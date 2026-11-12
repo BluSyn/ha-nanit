@@ -404,7 +404,10 @@ async def _async_migrate_sl_identities(
     # on a later boot falls back to this list instead of dropping them.
     # Skipped when /babies came back empty: setup never got as far as the
     # lookup, and writing its empty result would erase the fallback.
-    if hub.babies and hub.unpaired_speakers != entry.data.get(CONF_UNPAIRED_SPEAKERS, {}):
+    # Fork (sb): also persist on a baby-less account once a machine was found.
+    if (hub.babies or hub.unpaired_speakers) and hub.unpaired_speakers != entry.data.get(
+        CONF_UNPAIRED_SPEAKERS, {}
+    ):
         hass.config_entries.async_update_entry(
             entry,
             data={**entry.data, CONF_UNPAIRED_SPEAKERS: hub.unpaired_speakers},

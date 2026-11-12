@@ -1543,3 +1543,83 @@ async def test_unnamed_unpaired_speaker_failure_logs_a_real_name(
         await hub.async_setup()
 
     assert "Sound & Light Machine for Sound & Light spk_9abc failed" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Fork (sb): baby-less accounts (a standalone Sound & Light, no camera)
+# ---------------------------------------------------------------------------
+
+
+async def _setup_babyless(hass, mock_nanit_client, account_speakers, entry=None):
+    mock_nanit_client.async_get_babies.return_value = []
+    entry = entry or _make_entry(hass)
+    hub = NanitHub(hass, MagicMock(), entry)
+    sl_patch, coord_patch = _speaker_patches()
+    with (
+        sl_patch,
+        coord_patch as coord_cls,
+        patch.object(
+            NanitHub, "_async_get_account_speakers", AsyncMock(return_value=account_speakers)
+        ) as lookup,
+    ):
+        coord_cls.return_value = MagicMock(async_setup=AsyncMock())
+        await hub.async_setup()
+    return hub, coord_cls, lookup
+
+
+async def test_babyless_account_sets_up_standalone_speaker(
+    hass: HomeAssistant, mock_nanit_client
+) -> None:
+    """No baby profile: the account-level lookup still finds the machine."""
+    hub, coord_cls, lookup = await _setup_babyless(hass, mock_nanit_client, {"spk_9": "Kids Room"})
+
+    lookup.assert_awaited_once()
+    mock_nanit_client.async_get_speaker_candidates.assert_not_called()
+    assert set(hub.speaker_data) == {"spk_9"}
+    assert hub.unpaired_speakers == {"spk_9": "Kids Room"}
+    assert hub.camera_data == {}
+    assert coord_cls.call_args.kwargs["via_camera_uid"] is None
+
+
+async def test_babyless_account_uses_manual_ip(hass: HomeAssistant, mock_nanit_client) -> None:
+    """A manual IP keyed by speaker uid reaches the standalone machine."""
+    entry = _make_entry(hass, options={"speaker_ips": {"spk_9": "10.0.0.9"}})
+    with (
+        patch.object(NanitHub, "_setup_speaker", AsyncMock()) as setup_speaker,
+        suppress(NanitConnectionError),  # the stub sets nothing up
+    ):
+        await _setup_babyless(hass, mock_nanit_client, {"spk_9": "Kids Room"}, entry=entry)
+    assert setup_speaker.await_args.args[1:] == ("spk_9", "10.0.0.9")
+
+
+async def test_babyless_account_with_nothing_found_stays_loaded(
+    hass: HomeAssistant, mock_nanit_client
+) -> None:
+    """No babies and no machines keeps upstream behavior: no devices, no raise."""
+    hub, _, _ = await _setup_babyless(hass, mock_nanit_client, None)
+    assert hub.speaker_data == {}
+    assert hub.camera_data == {}
+
+
+async def test_babyless_lookup_failure_uses_stored_list(
+    hass: HomeAssistant, mock_nanit_client
+) -> None:
+    entry = _make_entry(hass)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, "unpaired_speakers": {"spk_9": "Kids Room"}}
+    )
+    hub, _, _ = await _setup_babyless(hass, mock_nanit_client, None, entry=entry)
+    assert set(hub.speaker_data) == {"spk_9"}
+
+
+def test_extract_speaker_rows_shapes() -> None:
+    from custom_components.nanit.hub import _extract_speaker_rows
+
+    assert _extract_speaker_rows({"speakers": [{"uid": "a", "name": "A"}]}) == [
+        {"uid": "a", "name": "A"}
+    ]
+    assert _extract_speaker_rows([{"speaker": {"uid": "b"}}]) == [{"uid": "b"}]
+    assert _extract_speaker_rows({"speaker": {"uid": "c"}}) == [{"uid": "c"}]
+    assert _extract_speaker_rows({"speakers": []}) == []
+    assert _extract_speaker_rows({"error": "x"}) is None
+    assert _extract_speaker_rows("nope") is None

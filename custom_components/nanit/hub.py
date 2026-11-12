@@ -78,6 +78,33 @@ _SPEAKER_SETUP_TIMEOUT: float = 60.0
 # Timeout for the raw /babies fetches (matches aionanit's own request
 # timeout; without it the shared HA session's 5 minute default applies).
 _RAW_FETCH_TIMEOUT = aiohttp.ClientTimeout(total=15)
+
+# Fork (sb): account-level endpoints tried, in order, to list Sound & Light
+# Machines when no baby exists to hang the candidates view off.
+_ACCOUNT_SPEAKER_PATHS: tuple[str, ...] = ("/speakers", "/user/speakers", "/users/me/speakers")
+
+
+def _extract_speaker_rows(body: Any) -> list[dict[str, Any]] | None:
+    """Pull speaker rows out of an account speaker listing, or None."""
+    rows: Any = None
+    if isinstance(body, list):
+        rows = body
+    elif isinstance(body, dict):
+        rows = body.get("speakers")
+        if rows is None and isinstance(body.get("speaker"), dict):
+            rows = [body["speaker"]]
+    if not isinstance(rows, list):
+        return None
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        # Some shapes nest the device: {"speaker": {"uid": ...}}.
+        inner = row.get("speaker")
+        out.append(inner if isinstance(inner, dict) and "uid" in inner else row)
+    return out
+
+
 # Pairing status of a speaker no baby is paired with (the app's
 # AVAILABLE_FOR_COUPLING).
 _UNPAIRED_STATUS = "available"
@@ -248,8 +275,13 @@ class NanitHub:
         self._babies = list(babies)
 
         if not babies:
-            _LOGGER.warning("No babies found on Nanit account")
-            return
+            # Fork (sb): an account whose only device is a Sound & Light
+            # Machine has no baby profile (the app only creates one when a
+            # camera is set up). Keep going so the account-level speaker
+            # lookup below can still find the machine.
+            _LOGGER.info(
+                "No babies found on Nanit account; looking for standalone Sound & Light Machines"
+            )
 
         speaker_uid_map = await self._async_resolve_speaker_uids(babies)
         self._speaker_uid_map = speaker_uid_map
@@ -308,6 +340,12 @@ class NanitHub:
                 )
             )
             owners.append(("speaker", placeholder))
+
+        if not tasks and not babies:
+            # Fork (sb): no babies and no standalone machine found — keep the
+            # upstream behavior of a loaded entry with nothing to set up.
+            _LOGGER.warning("No babies or Sound & Light Machines found on Nanit account")
+            return
 
         if not tasks:
             # Babies exist but nothing could even be attempted (no cameras
@@ -680,6 +718,15 @@ class NanitHub:
             break
 
         if found is None:
+            # Fork (sb): no baby answered (typically: there are no babies at
+            # all), so ask the account-level speaker list instead.
+            found = await self._async_get_account_speakers()
+            if found is not None:
+                for uid in list(found):
+                    if uid in speaker_uid_map.values():
+                        del found[uid]
+
+        if found is None:
             if stored:
                 _LOGGER.warning(
                     "Could not look up unpaired Sound & Light Machines, "
@@ -696,6 +743,68 @@ class NanitHub:
         paired = set(speaker_uid_map.values())
         merged = {**stored, **(found or {})}
         return {uid: name for uid, name in merged.items() if uid not in paired}
+
+    async def _async_get_account_speakers(self) -> dict[str, str] | None:
+        """List the account's Sound & Light Machines without a baby uid.
+
+        Fork (sb). The candidates view hangs off a baby, which a
+        speaker-only account does not have. Try account-level speaker
+        listings, read-only, and return speaker_uid -> name from the first
+        one that answers with a recognizable shape. Returns None when none
+        does, so the caller falls back to the persisted list. Never raises
+        (auth problems included): /babies already validated the token.
+        """
+        from aionanit.rest import NANIT_API_HEADERS, _sanitize_name
+
+        tm = self._client.token_manager
+        if tm is None:
+            return None
+        try:
+            access_token = await tm.async_get_access_token()
+        except Exception as err:
+            _LOGGER.debug("Account speaker lookup: no access token (%s)", err)
+            return None
+        rest = self._client.rest_client
+        for path in _ACCOUNT_SPEAKER_PATHS:
+            try:
+                async with rest.session.get(
+                    f"{rest.base_url}{path}",
+                    headers={**NANIT_API_HEADERS, "Authorization": access_token},
+                    timeout=_RAW_FETCH_TIMEOUT,
+                ) as resp:
+                    status = resp.status
+                    if status != 200:
+                        _LOGGER.debug("Account speaker lookup %s -> HTTP %s", path, status)
+                        continue
+                    body = await resp.json(content_type=None)
+            except Exception as err:
+                _LOGGER.debug("Account speaker lookup %s failed: %s", path, err)
+                continue
+            rows = _extract_speaker_rows(body)
+            if rows is None:
+                _LOGGER.debug(
+                    "Account speaker lookup %s: unrecognized shape (keys: %s)",
+                    path,
+                    sorted(body)[:20] if isinstance(body, dict) else type(body).__name__,
+                )
+                continue
+            found: dict[str, str] = {}
+            for row in rows:
+                uid = _clean_uid(row.get("uid"))
+                if uid is None:
+                    continue
+                found[uid] = _sanitize_name(row.get("name")) or "Sound & Light"
+            _LOGGER.info(
+                "Account speaker lookup %s found %d Sound & Light Machine(s)", path, len(found)
+            )
+            return found
+        _LOGGER.warning(
+            "Could not list Sound & Light Machines for this account without a baby "
+            "profile (tried %s); enable debug logging for custom_components.nanit "
+            "to see the responses",
+            ", ".join(_ACCOUNT_SPEAKER_PATHS),
+        )
+        return None
 
     async def _setup_camera(self, baby: Baby) -> None:
         """Create a camera instance and its coordinators for a single baby."""
