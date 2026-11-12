@@ -25,7 +25,7 @@
     "aionanit"
   ],
   "requirements": [
-    "aionanit==0.0.0"
+    "aionanit==1.14.1"
   ],
-  "version": "0.0.0"
+  "version": "1.14.1-sb.1"
 }

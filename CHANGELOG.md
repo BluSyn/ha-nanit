@@ -338,3 +338,7 @@ Tooling and internal changes only.
  Mic mute switch
  Status LED switch
  Baby connectivity binary sensor
+
+## 1.14.1-sb.1 (Steven Bower fork)
+
+- Standalone Sound & Light on an account with no baby profile (no camera): discovered via account-level speaker listing.
